@@ -1,0 +1,10 @@
+rclone-ignore.txt
+.git/
+
+Python/bin/
+Python/include/
+Python/lib/
+Python/lib64/
+Python/.venv/
+/Python/pyvenv.cfg
+
