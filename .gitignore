@@ -15,4 +15,6 @@ Python/.venv/
 
 # R FOLDERS #
 
-R/renv/library/
+R/
+.Rproj.user
+.positai

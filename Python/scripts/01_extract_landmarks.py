@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 import os
 import sys
 from pathlib import Path
@@ -126,26 +127,23 @@ def estimate_pose(xyz):
     return {"yaw_deg": yaw, "roll_deg": roll, "iod_px": iod}
 
 
-# TPS EXPORT
-def write_tps(path, specimens):
-    with open(path, "w") as f:
-        for spec in specimens:
-            coords = spec["coords"]
-            n_dims = coords.shape[1]
-            header = "LM" if n_dims == 2 else f"LM{n_dims}"
-            f.write(f"{header}={coords.shape[0]}\n")
-            for row in coords:
-                f.write(" ".join(f"{v:.4f}" for v in row) + "\n")
-            if "image" in spec:
-                f.write(f"IMAGE={spec['image']}\n")
-            f.write(f"ID={spec['id']}\n")
-            f.write(f"SCALE={spec.get('scale', 1.0)}\n")
+# TPS EXPORT — single-specimen streaming version
+def write_tps_specimen(f, spec):
+    coords = spec["coords"]
+    n_dims = coords.shape[1]
+    header = "LM" if n_dims == 2 else f"LM{n_dims}"
+    f.write(f"{header}={coords.shape[0]}\n")
+    for row in coords:
+        f.write(" ".join(f"{v:.4f}" for v in row) + "\n")
+    if "image" in spec:
+        f.write(f"IMAGE={spec['image']}\n")
+    f.write(f"ID={spec['id']}\n")
+    f.write(f"SCALE={spec.get('scale', 1.0)}\n")
 
 
 # LAND.PAIRS EXPORT
 def write_land_pairs(path, pairs):
     names = list(pairs.keys())
-
     K = len(names)
     with open(path, "w") as f:
         f.write(
@@ -154,7 +152,6 @@ def write_land_pairs(path, pairs):
         )
         for i, name in enumerate(names):
             mp_l, mp_r = pairs[name]
-
             f.write(f"{name},{i + 1},{K + i + 1},{mp_l},{mp_r}\n")
 
 
@@ -186,104 +183,121 @@ def main():
     subset_idx = left_idx + right_idx
     n_landmarks = len(subset_idx)
 
-    tps_specimens_paired = []
-    tps_specimens_full = []
-    meta_rows = []
-    fullimg_rows = []
+    meta_fields = [
+        "id", "photo_id", "replicate", "image_file",
+        "yaw_deg", "roll_deg", "iod_px",
+        "bbox_x0", "bbox_y0", "bbox_x1", "bbox_y1",
+        "crop_w", "crop_h",
+    ]
 
-    for img_path in images:
-        photo_id = img_path.stem
-        print(f"Processing {photo_id}")
-        try:
-            reps, image_bgr = detector.run_with_perturbations(
-                img_path,
-                n_replicates=args.n_replicates,
-                perturb_frac=args.perturb_frac,
-                seed=hash(photo_id) & 0xFFFF,
-            )
-        except (RuntimeError, FileNotFoundError) as e:
-            print(f"  /!\ Skipping {photo_id}: {e}")
-            continue
+    n_specimens = 0
 
-        for rep_idx, rep in enumerate(reps):
-            rep_id = f"{photo_id}__rep{rep_idx:02d}"
-            xyz_crop = rep["xyz_crop"]
-            xy_full = rep["xy_full"]
-            pose = estimate_pose(xyz_crop)
+    # Open all output files before the loop — stream writes, no accumulation
+    with (
+        open(out_dir / "landmarks_paired.tps", "w") as tps_paired_f,
+        open(out_dir / "landmarks_full.tps", "w") as tps_full_f,
+        open(out_dir / "metadata.csv", "w", newline="") as meta_f,
+        open(out_dir / "landmarks_fullimg.csv", "w", newline="") as fullimg_f,
+    ):
+        meta_writer = csv.DictWriter(meta_f, fieldnames=meta_fields)
+        meta_writer.writeheader()
 
-            coords_paired_2d = xyz_crop[subset_idx, :2]
-            tps_specimens_paired.append(
-                {
-                    "id": rep_id,
-                    "coords": coords_paired_2d,
-                    "image": img_path.name,
-                    "scale": 1.0,
-                }
-            )
-            tps_specimens_full.append(
-                {
-                    "id": rep_id,
-                    "coords": xyz_crop[:, :2],
-                    "image": img_path.name,
-                    "scale": 1.0,
-                }
-            )
+        fullimg_writer = csv.DictWriter(
+            fullimg_f, fieldnames=["id", "landmark_idx", "x_px", "y_px"]
+        )
+        fullimg_writer.writeheader()
 
-            meta_rows.append(
-                {
-                    "id": rep_id,
-                    "photo_id": photo_id,
-                    "replicate": rep_idx,
-                    "image_file": img_path.name,
-                    "yaw_deg": round(pose["yaw_deg"], 4),
-                    "roll_deg": round(pose["roll_deg"], 4),
-                    "iod_px": round(pose["iod_px"], 4),
-                    "bbox_x0": rep["bbox_full"][0],
-                    "bbox_y0": rep["bbox_full"][1],
-                    "bbox_x1": rep["bbox_full"][2],
-                    "bbox_y1": rep["bbox_full"][3],
-                    "crop_w": rep["crop_size"][0],
-                    "crop_h": rep["crop_size"][1],
-                }
-            )
-            for lm_idx in range(xy_full.shape[0]):
-                fullimg_rows.append(
+        for img_path in images:
+            photo_id = img_path.stem
+            print(f"Processing {photo_id}")
+            try:
+                reps, image_bgr = detector.run_with_perturbations(
+                    img_path,
+                    n_replicates=args.n_replicates,
+                    perturb_frac=args.perturb_frac,
+                    seed=hash(photo_id) & 0xFFFF,
+                )
+            except (RuntimeError, FileNotFoundError) as e:
+                print(f"  /!\\ Skipping {photo_id}: {e}")
+                continue
+
+            for rep_idx, rep in enumerate(reps):
+                rep_id = f"{photo_id}__rep{rep_idx:02d}"
+                xyz_crop = rep["xyz_crop"]
+                xy_full = rep["xy_full"]
+                pose = estimate_pose(xyz_crop)
+
+                # Write paired TPS specimen immediately
+                write_tps_specimen(
+                    tps_paired_f,
                     {
                         "id": rep_id,
-                        "landmark_idx": lm_idx,
-                        "x_px": round(float(xy_full[lm_idx, 0]), 3),
-                        "y_px": round(float(xy_full[lm_idx, 1]), 3),
+                        "coords": xyz_crop[subset_idx, :2],
+                        "image": img_path.name,
+                        "scale": 1.0,
+                    },
+                )
+
+                # Write full TPS specimen immediately
+                write_tps_specimen(
+                    tps_full_f,
+                    {
+                        "id": rep_id,
+                        "coords": xyz_crop[:, :2],
+                        "image": img_path.name,
+                        "scale": 1.0,
+                    },
+                )
+
+                # Write metadata row immediately
+                meta_writer.writerow(
+                    {
+                        "id": rep_id,
+                        "photo_id": photo_id,
+                        "replicate": rep_idx,
+                        "image_file": img_path.name,
+                        "yaw_deg": round(pose["yaw_deg"], 4),
+                        "roll_deg": round(pose["roll_deg"], 4),
+                        "iod_px": round(pose["iod_px"], 4),
+                        "bbox_x0": rep["bbox_full"][0],
+                        "bbox_y0": rep["bbox_full"][1],
+                        "bbox_x1": rep["bbox_full"][2],
+                        "bbox_y1": rep["bbox_full"][3],
+                        "crop_w": rep["crop_size"][0],
+                        "crop_h": rep["crop_size"][1],
                     }
                 )
 
-    write_tps(out_dir / "landmarks_paired.tps", tps_specimens_paired)
+                # Write fullimg rows immediately — no list accumulation
+                for lm_idx in range(xy_full.shape[0]):
+                    fullimg_writer.writerow(
+                        {
+                            "id": rep_id,
+                            "landmark_idx": lm_idx,
+                            "x_px": round(float(xy_full[lm_idx, 0]), 3),
+                            "y_px": round(float(xy_full[lm_idx, 1]), 3),
+                        }
+                    )
+
+                n_specimens += 1
+
+            # Explicitly release the image array after processing all replicates
+            del image_bgr
+            del reps
+
     print(
         f"  -> {out_dir / 'landmarks_paired.tps'}  "
-        f"({len(tps_specimens_paired)} specimens × {n_landmarks} landmarks)"
+        f"({n_specimens} specimens × {n_landmarks} landmarks)"
     )
-
-    write_tps(out_dir / "landmarks_full.tps", tps_specimens_full)
     print(
         f"  -> {out_dir / 'landmarks_full.tps'}  "
-        f"({len(tps_specimens_full)} specimens * 468 landmarks)"
+        f"({n_specimens} specimens × 468 landmarks)"
     )
 
     write_land_pairs(out_dir / "land_pairs.csv", BILATERAL_PAIRS)
     print(f"  -> {out_dir / 'land_pairs.csv'}")
-
-    with open(out_dir / "metadata.csv", "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(meta_rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(meta_rows)
     print(f"  -> {out_dir / 'metadata.csv'}")
-
-    with open(out_dir / "landmarks_fullimg.csv", "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["id", "landmark_idx", "x_px", "y_px"])
-        writer.writeheader()
-        writer.writerows(fullimg_rows)
     print(f"  -> {out_dir / 'landmarks_fullimg.csv'}")
-
-    import json
 
     with open(out_dir / "bilateral_pairs.json", "w") as f:
         json.dump(
@@ -299,8 +313,8 @@ def main():
     print(f"  -> {out_dir / 'bilateral_pairs.json'}")
 
     print(
-        f"\nDone. Processed {len(images)} images * {args.n_replicates} replicates "
-        f"= {len(tps_specimens_paired)} specimens."
+        f"\nDone. Processed {len(images)} images × {args.n_replicates} replicates "
+        f"= {n_specimens} specimens."
     )
 
 
