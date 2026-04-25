@@ -1,10 +1,18 @@
+# ROOT FILES #
+
 rclone-ignore.txt
+
+# ROOT FOLDERS #
+
 .git/
+input/
+models/
+output/
 
-Python/bin/
-Python/include/
-Python/lib/
-Python/lib64/
+# PYTHON FOLDERS #
+
 Python/.venv/
-/Python/pyvenv.cfg
 
+# R FOLDERS #
+
+R/renv/library/
